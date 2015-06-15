@@ -31,3 +31,4 @@ securekey.key
 /target/
 .DS_Store
 data/
+.idea/
