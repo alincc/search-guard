@@ -17,14 +17,13 @@
 
 package com.floragunn.searchguard.service;
 
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-
+import com.floragunn.searchguard.util.ConfigConstants;
+import org.apache.commons.io.IOUtils;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
+import org.elasticsearch.action.admin.indices.exists.indices.IndicesExistsRequest;
+import org.elasticsearch.action.count.CountRequest;
 import org.elasticsearch.action.get.GetResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.bytes.BytesReference;
@@ -36,7 +35,7 @@ import org.elasticsearch.common.util.concurrent.FutureUtils;
 import org.elasticsearch.indices.IndexMissingException;
 import org.elasticsearch.indices.IndicesService;
 
-import com.floragunn.searchguard.util.ConfigConstants;
+import java.util.concurrent.*;
 
 public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchGuardConfigService> {
 
@@ -44,10 +43,10 @@ public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchG
     private final Settings settings;
     private final String securityConfigurationIndex;
     private final IndicesService indicesService;
+    private final CountDownLatch latch = new CountDownLatch(1);
     private volatile BytesReference securityConfiguration;
     private ScheduledThreadPoolExecutor scheduler;
     private ScheduledFuture scheduledFuture;
-    private final CountDownLatch latch = new CountDownLatch(1);
 
     @Inject
     public SearchGuardConfigService(final Settings settings, final Client client, final IndicesService indicesService) {
@@ -68,7 +67,7 @@ public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchG
     public BytesReference getSecurityConfiguration() {
         try {
             if (!latch.await(1, TimeUnit.MINUTES)) {
-                throw new ElasticsearchException("Security configuration cannot be loaded for unknown reasons");
+                throw new ElasticsearchException("Security configuration cannot be loaded for unknown reasons.");
             }
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -77,7 +76,9 @@ public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchG
     }
 
     //blocking
-    private void reloadConfig() {
+    private void reloadConfig() throws Exception {
+        createAclIfNoRecord();
+
         client.prepareGet(securityConfigurationIndex, "ac", "ac").setRefresh(true).execute(new ActionListener<GetResponse>() {
 
             @Override
@@ -86,8 +87,7 @@ public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchG
                 if (response.isExists() && !response.isSourceEmpty()) {
                     securityConfiguration = response.getSourceAsBytesRef();
                     latch.countDown();
-                    logger.info("Security configuration reloaded");
-
+                    logger.trace("Security configuration reloaded");
                 }
             }
 
@@ -104,13 +104,42 @@ public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchG
         });
     }
 
-    private class Reload implements Runnable {
-        @Override
-        public void run() {
-            synchronized (SearchGuardConfigService.this) {
-                reloadConfig();
-            }
+    private void createAclIfNoRecord() throws Exception {
+        logger.debug("Verifying ACL rules");
+
+        if (!indexExists()) {
+            createIndex();
         }
+
+        if (defaultIndexIsEmpty()) {
+            logger.info("Creating default ACL rules");
+
+            // Load default ACL
+            byte[] defaultAcl = IOUtils.toString(SearchGuardConfigService.class.getClassLoader().getResourceAsStream("default-acl.json")).getBytes();
+
+            // Create index
+            client.prepareIndex(securityConfigurationIndex, "ac", "ac")
+                    .setSource(defaultAcl)
+                    .execute()
+                    .actionGet();
+
+            logger.info("Default ACL rules created successfully.");
+        }
+    }
+
+    private boolean defaultIndexIsEmpty() {
+        CountRequest countRequest = new CountRequest(securityConfigurationIndex);
+        return client.count(countRequest).actionGet().getCount() == 0;
+    }
+
+    private boolean createIndex() {
+        CreateIndexRequest index = new CreateIndexRequest(securityConfigurationIndex);
+        return client.admin().indices().create(index).actionGet().isAcknowledged();
+    }
+
+    private boolean indexExists() {
+        IndicesExistsRequest index = new IndicesExistsRequest(securityConfigurationIndex);
+        return client.admin().indices().exists(index).actionGet().isExists();
     }
 
     @Override
@@ -126,11 +155,26 @@ public class SearchGuardConfigService extends AbstractLifecycleComponent<SearchG
     protected void doStop() throws ElasticsearchException {
         FutureUtils.cancel(this.scheduledFuture);
         this.scheduler.shutdown();
+
     }
 
     @Override
     protected void doClose() throws ElasticsearchException {
         FutureUtils.cancel(this.scheduledFuture);
         this.scheduler.shutdown();
+
+    }
+
+    private class Reload implements Runnable {
+        @Override
+        public void run() {
+            synchronized (SearchGuardConfigService.this) {
+                try {
+                    reloadConfig();
+                } catch (Exception e) {
+                    logger.error("Failed to reload configuration", e);
+                }
+            }
+        }
     }
 }
